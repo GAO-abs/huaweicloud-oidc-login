@@ -1,0 +1,147 @@
+name: Huawei Cloud OIDC Login
+description: Exchange a GitHub Actions OIDC token for temporary Huawei Cloud credentials, with no stored AK/SK.
+author: George Ajayi
+
+branding:
+  icon: log-in
+  color: red
+
+inputs:
+  account-id:
+    description: Huawei Cloud account ID that owns the identity provider and the trust agency.
+    required: true
+  agency-name:
+    description: Name of the trust agency to assume.
+    required: true
+  region:
+    description: Region of the STS endpoint to call, for example af-south-1.
+    required: true
+  provider-name:
+    description: Name of the OIDC identity provider in IAM.
+    required: false
+    default: GitHubActions
+  audience:
+    description: Audience requested for the GitHub token. Must match the audience on the identity provider and the trust agency.
+    required: false
+    default: huawei-cloud-service
+  session-name:
+    description: Name of the agency session, shown in audit logs. Defaults to gha-<run id>-<run attempt>.
+    required: false
+    default: ""
+  duration-seconds:
+    description: Lifetime of the credentials in seconds (900 up to the agency's maximum session duration).
+    required: false
+    default: "3600"
+  export-env:
+    description: Set to "false" to skip exporting the credentials as environment variables and use the step outputs only.
+    required: false
+    default: "true"
+
+outputs:
+  access-key:
+    description: Temporary access key (AK).
+    value: ${{ steps.exchange.outputs.access-key }}
+  secret-key:
+    description: Temporary secret key (SK).
+    value: ${{ steps.exchange.outputs.secret-key }}
+  security-token:
+    description: Security token that must accompany the temporary AK/SK.
+    value: ${{ steps.exchange.outputs.security-token }}
+  expiration:
+    description: Expiry time of the credentials, UTC, ISO 8601.
+    value: ${{ steps.exchange.outputs.expiration }}
+
+runs:
+  using: composite
+  steps:
+    - name: Exchange GitHub OIDC token for Huawei Cloud credentials
+      id: exchange
+      shell: bash
+      env:
+        INPUT_ACCOUNT_ID: ${{ inputs.account-id }}
+        INPUT_AGENCY_NAME: ${{ inputs.agency-name }}
+        INPUT_REGION: ${{ inputs.region }}
+        INPUT_PROVIDER_NAME: ${{ inputs.provider-name }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+        INPUT_SESSION_NAME: ${{ inputs.session-name }}
+        INPUT_DURATION_SECONDS: ${{ inputs.duration-seconds }}
+        INPUT_EXPORT_ENV: ${{ inputs.export-env }}
+      run: |
+        set -euo pipefail
+
+        fail() { echo "::error title=Huawei Cloud login failed::$1"; exit 1; }
+
+        command -v curl >/dev/null || fail "curl is not installed on this runner."
+        command -v jq   >/dev/null || fail "jq is not installed on this runner."
+
+        [ -n "$INPUT_ACCOUNT_ID" ]  || fail "Input 'account-id' is empty."
+        [ -n "$INPUT_AGENCY_NAME" ] || fail "Input 'agency-name' is empty."
+        [ -n "$INPUT_REGION" ]      || fail "Input 'region' is empty."
+        [[ "$INPUT_DURATION_SECONDS" =~ ^[0-9]+$ ]] || fail "Input 'duration-seconds' must be a whole number."
+
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          fail "No OIDC token endpoint available. Add 'permissions: id-token: write' to the calling workflow or job."
+        fi
+
+        SESSION_NAME="${INPUT_SESSION_NAME:-}"
+        [ -n "$SESSION_NAME" ] || SESSION_NAME="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+
+        # 1. Ask GitHub for an identity token for this run.
+        ID_TOKEN=$(curl -sS --fail-with-body --retry 3 \
+          -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          --get --data-urlencode "audience=${INPUT_AUDIENCE}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}" | jq -r '.value // empty') \
+          || fail "Could not get an OIDC token from GitHub."
+        [ -n "$ID_TOKEN" ] || fail "GitHub returned an empty OIDC token."
+        echo "::add-mask::${ID_TOKEN}"
+
+        # 2. Trade it with Huawei Cloud STS for temporary credentials.
+        BODY=$(jq -n \
+          --arg agency   "iam::${INPUT_ACCOUNT_ID}:agency:${INPUT_AGENCY_NAME}" \
+          --arg provider "iam::${INPUT_ACCOUNT_ID}:oidcProvider:${INPUT_PROVIDER_NAME}" \
+          --arg session  "$SESSION_NAME" \
+          --arg token    "$ID_TOKEN" \
+          --argjson duration "$INPUT_DURATION_SECONDS" \
+          '{agency_urn: $agency, provider_urn: $provider, agency_session_name: $session, id_token: $token, duration_seconds: $duration}')
+
+        STS_URL="https://sts.${INPUT_REGION}.myhuaweicloud.com/v5/agencies/assume-with-oidc"
+        RESP=$(curl -sS --retry 3 -X POST "$STS_URL" \
+          -H "Content-Type: application/json" -d "$BODY") \
+          || fail "Could not reach ${STS_URL}. Check the 'region' input."
+
+        AK=$(jq -r '.credentials.access_key_id // empty'     <<<"$RESP" 2>/dev/null || true)
+        SK=$(jq -r '.credentials.secret_access_key // empty' <<<"$RESP" 2>/dev/null || true)
+        ST=$(jq -r '.credentials.security_token // empty'    <<<"$RESP" 2>/dev/null || true)
+        EXP=$(jq -r '.credentials.expiration // empty'       <<<"$RESP" 2>/dev/null || true)
+
+        if [ -z "$AK" ] || [ -z "$SK" ] || [ -z "$ST" ]; then
+          echo "Response from Huawei Cloud STS:"
+          echo "$RESP"
+          # The 'sub' claim is what the agency's oidc:sub condition is matched against.
+          SUB=$(cut -d. -f2 <<<"$ID_TOKEN" | tr '_-' '/+' | awk '{ while (length($0) % 4) $0 = $0 "="; print }' \
+            | base64 -d 2>/dev/null | jq -r '.sub // empty' 2>/dev/null || true)
+          [ -z "$SUB" ] || echo "This run's token subject (sub): ${SUB}"
+          fail "STS did not return credentials. See the response above."
+        fi
+
+        # 3. Mask the values, then hand them to later steps.
+        echo "::add-mask::${AK}"
+        echo "::add-mask::${SK}"
+        echo "::add-mask::${ST}"
+
+        {
+          echo "access-key=${AK}"
+          echo "secret-key=${SK}"
+          echo "security-token=${ST}"
+          echo "expiration=${EXP}"
+        } >> "$GITHUB_OUTPUT"
+
+        if [ "$INPUT_EXPORT_ENV" != "false" ]; then
+          {
+            echo "HW_ACCESS_KEY=${AK}"
+            echo "HW_SECRET_KEY=${SK}"
+            echo "HW_SECURITY_TOKEN=${ST}"
+          } >> "$GITHUB_ENV"
+        fi
+
+        echo "Logged in to Huawei Cloud as agency '${INPUT_AGENCY_NAME}' (session ${SESSION_NAME}), valid until ${EXP:-unknown}."
